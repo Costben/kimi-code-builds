@@ -1,0 +1,4 @@
+# Patches must reach `git apply` byte-for-byte: a CRLF checkout on the Windows
+# runner breaks every hunk.
+* text=auto eol=lf
+*.patch -text
