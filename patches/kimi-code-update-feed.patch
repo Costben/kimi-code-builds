@@ -1,0 +1,77 @@
+diff --git a/apps/kimi-code/src/cli/update/native-manifest.ts b/apps/kimi-code/src/cli/update/native-manifest.ts
+index eb81c94..409b200 100644
+--- a/apps/kimi-code/src/cli/update/native-manifest.ts
++++ b/apps/kimi-code/src/cli/update/native-manifest.ts
+@@ -47,11 +47,11 @@ export type NativeReleaseManifest = z.infer<typeof NativeReleaseManifestSchema>;
+ export type NativePlatformEntry = z.infer<typeof PlatformEntrySchema>;
+ 
+ export function nativeManifestUrl(version: string): string {
+-  return `${kimiCodeCdnBinariesBase()}/${version}/manifest.json`;
++  return `${kimiCodeCdnBinariesBase()}/v${version}/manifest.json`;
+ }
+ 
+ export function nativeBinaryUrl(version: string, filename: string): string {
+-  return `${kimiCodeCdnBinariesBase()}/${version}/${filename}`;
++  return `${kimiCodeCdnBinariesBase()}/v${version}/${filename}`;
+ }
+ 
+ /**
+diff --git a/apps/kimi-code/src/constant/app.ts b/apps/kimi-code/src/constant/app.ts
+index c90b616..a090446 100644
+--- a/apps/kimi-code/src/constant/app.ts
++++ b/apps/kimi-code/src/constant/app.ts
+@@ -100,25 +100,26 @@ export const FEEDBACK_TELEMETRY_EVENT = 'feedback_submitted';
+ export function kimiCodeCdnBase(): string {
+   return currentKimiProfile().cdnBase;
+ }
++// Update feeds come from the Costben/kimi-code-builds Releases, which carry
++// this build's patches; the region CDN above still serves plugins and rg.
++// Release tags are `v<version>`; `latest` excludes prereleases.
++export const KIMI_CODE_BUILDS_RELEASES = 'https://github.com/Costben/kimi-code-builds/releases';
+ export function kimiCodeCdnLatestUrl(): string {
+-  return `${kimiCodeCdnBase()}/latest`;
++  return `${KIMI_CODE_BUILDS_RELEASES}/latest/download/latest`;
+ }
+-// Rollout manifest consumed by update checks; the plain-text `/latest` above
+-// stays unchanged forever — already-shipped clients hard-fail on non-semver
+-// bodies, and the CDN install scripts read it for fresh installs.
++// Rollout manifest consumed by update checks, same wire shape as the CDN's.
+ export function kimiCodeCdnLatestJsonUrl(): string {
+-  return `${kimiCodeCdnBase()}/latest.json`;
++  return `${KIMI_CODE_BUILDS_RELEASES}/latest/download/latest.json`;
+ }
+-// Canary channel pointer, same wire shape as `latest.json`. Only the selected
+-// canary channel reads it; stable never requests it.
++// No canary line is built: each Release publishes `canary.json` as a copy of
++// `latest.json`, so the canary channel follows stable.
+ export function kimiCodeCdnCanaryChannelUrl(): string {
+-  return `${kimiCodeCdnBase()}/channels/canary.json`;
++  return `${KIMI_CODE_BUILDS_RELEASES}/latest/download/canary.json`;
+ }
+-// Per-release native artifacts: `/binaries/<version>/manifest.json` +
+-// `/binaries/<version>/kimi-code-<target>[.exe]` — the bare platform binary
+-// (same layout install.ps1 consumes).
++// Per-release native artifacts: `<base>/v<version>/manifest.json` +
++// `<base>/v<version>/kimi-code-<target>[.exe|.zst]`.
+ export function kimiCodeCdnBinariesBase(): string {
+-  return `${kimiCodeCdnBase()}/binaries`;
++  return `${KIMI_CODE_BUILDS_RELEASES}/download`;
+ }
+ // The marketplace env override name lives in the shared agent-core-v2 plugin
+ // domain (kap-server consumes it from there). Deep-path import: this module is
+diff --git a/apps/kimi-code/test/cli/update/native-manifest.test.ts b/apps/kimi-code/test/cli/update/native-manifest.test.ts
+index 74f455b..7c56255 100644
+--- a/apps/kimi-code/test/cli/update/native-manifest.test.ts
++++ b/apps/kimi-code/test/cli/update/native-manifest.test.ts
+@@ -196,9 +196,9 @@ describe('selectPlatformEntry', () => {
+ 
+ describe('url helpers', () => {
+   it('builds the manifest and binary URLs from the binaries base', () => {
+-    expect(nativeManifestUrl(VERSION)).toBe(`${kimiCodeCdnBinariesBase()}/${VERSION}/manifest.json`);
++    expect(nativeManifestUrl(VERSION)).toBe(`${kimiCodeCdnBinariesBase()}/v${VERSION}/manifest.json`);
+     expect(nativeBinaryUrl(VERSION, 'kimi-code-win32-x64.zip')).toBe(
+-      `${kimiCodeCdnBinariesBase()}/${VERSION}/kimi-code-win32-x64.zip`,
++      `${kimiCodeCdnBinariesBase()}/v${VERSION}/kimi-code-win32-x64.zip`,
+     );
+   });
+ });

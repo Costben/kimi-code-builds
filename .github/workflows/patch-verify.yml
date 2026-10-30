@@ -1,0 +1,90 @@
+name: Verify patches against an upstream tag
+
+# Pre-flight for a patch refresh, and the gate in front of every build: apply the
+# patch series to an upstream tag, build the workspace packages, typecheck the two
+# packages the patches touch, and run the test files they touch or add. No native
+# binary is built and nothing is published, so a broken patch fails here in
+# minutes instead of after the native matrix.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag, e.g. @moonshot-ai/kimi-code@2.4.0 (blank = latest stable release)"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: MoonshotAI/kimi-code
+
+jobs:
+  verify:
+    name: apply, typecheck and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Resolve upstream tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq '.tag_name')"
+          fi
+          echo "Verifying patches against $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream tag
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.pick.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Checkout build repo
+        uses: actions/checkout@v6
+        with:
+          path: .builds
+
+      - name: Apply patches
+        run: bash .builds/scripts/apply-patches.sh .
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages
+        run: pnpm run build:packages
+
+      - name: Typecheck patched packages
+        run: |
+          pnpm --filter @moonshot-ai/acp-server run typecheck
+          pnpm --filter @moonshot-ai/kimi-code run typecheck
+
+      - name: Test patched files
+        run: |
+          pnpm exec vitest run \
+            packages/acp-server/test/steering.test.ts \
+            packages/acp-server/test/initialize.test.ts \
+            packages/acp-server/test/e2e-turn.test.ts \
+            apps/kimi-code/test/cli/update/cdn.test.ts \
+            apps/kimi-code/test/cli/update/native-manifest.test.ts \
+            apps/kimi-code/test/cli/update/native-stage.test.ts

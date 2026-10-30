@@ -1,0 +1,264 @@
+diff --git a/packages/acp-server/src/server.ts b/packages/acp-server/src/server.ts
+index c2157fa..dc8c658 100644
+--- a/packages/acp-server/src/server.ts
++++ b/packages/acp-server/src/server.ts
+@@ -29,6 +29,7 @@ import {
+   type ClientCapabilities,
+   type CloseSessionRequest,
+   type CloseSessionResponse,
++  type ContentBlock,
+   type DeleteSessionRequest,
+   type DeleteSessionResponse,
+   type ForkSessionRequest,
+@@ -72,7 +73,7 @@ import { buildTerminalAuthMethod, TERMINAL_AUTH_METHOD } from './auth-methods';
+ import { acpMcpServersToConfigRecord } from './convert';
+ import { log } from './log';
+ import { isAcpModeId } from './modes';
+-import { AcpSession } from './session';
++import { AcpSession, type SteerResponse } from './session';
+ import { negotiateVersion } from './version';
+ 
+ /**
+@@ -236,6 +237,9 @@ export class AcpServer {
+           : TERMINAL_AUTH_METHOD,
+       ],
+       ...(this.agentInfo ? { agentInfo: this.agentInfo } : {}),
++      // Same advertisement `claude-agent-acp` and `codex-acp` use for
++      // `_session/steering`, so hosts detect it without per-vendor branching.
++      _meta: { steering: { supported: true } },
+     };
+   }
+ 
+@@ -434,6 +438,15 @@ export class AcpServer {
+     }
+   }
+ 
++  /** Handle `_session/steering` (see {@link AcpSession.steer}). */
++  async steer(params: SteerRequest): Promise<SteerResponse> {
++    const acpSession = this.sessions.get(params.sessionId);
++    if (!acpSession) {
++      throw RequestError.invalidParams(undefined, `Unknown sessionId: ${params.sessionId}`);
++    }
++    return acpSession.steer(params.prompt);
++  }
++
+   async cancel(params: CancelNotification): Promise<void> {
+     const acpSession = this.sessions.get(params.sessionId);
+     if (!acpSession) {
+@@ -662,6 +675,26 @@ export class AcpServer {
+ /** The custom ACP method name for per-session model selection. */
+ const SET_SESSION_MODEL_METHOD = 'session/set_model';
+ 
++/** The extension method that injects input into the running turn. */
++const SESSION_STEERING_METHOD = '_session/steering';
++
++/** Parsed params of `_session/steering`. */
++export interface SteerRequest {
++  readonly sessionId: string;
++  readonly prompt: readonly ContentBlock[];
++}
++
++function parseSteerParams(params: unknown): SteerRequest {
++  const { sessionId, prompt } = (params ?? {}) as Record<string, unknown>;
++  if (typeof sessionId !== 'string' || !Array.isArray(prompt)) {
++    throw RequestError.invalidParams(
++      params,
++      '_session/steering expects { sessionId: string, prompt: ContentBlock[] }',
++    );
++  }
++  return { sessionId, prompt: prompt as ContentBlock[] };
++}
++
+ /** Parsed params of the custom `session/set_model` request. */
+ export interface SetSessionModelParams {
+   readonly sessionId: string;
+@@ -717,7 +750,8 @@ export function createAcpAgentApp(getServer: () => AcpServer): AgentApp {
+     .onNotification(methods.agent.session.cancel, (ctx) => getServer().cancel(ctx.params))
+     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, (ctx) =>
+       getServer().setSessionModel(ctx.params),
+-    );
++    )
++    .onRequest(SESSION_STEERING_METHOD, parseSteerParams, (ctx) => getServer().steer(ctx.params));
+ }
+ 
+ /**
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+index 89756ec..0e4cc1c 100644
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -164,6 +164,14 @@ interface ResolvedCommands {
+   readonly skillCommandMap: ReadonlyMap<string, string>;
+ }
+ 
++/**
++ * Result of `_session/steering`, the wire shape `claude-agent-acp` and
++ * `codex-acp` use, plus `unconsumed` for "no live turn, send it as a prompt".
++ */
++export interface SteerResponse {
++  readonly outcome: 'injected' | 'startedNewTurn' | 'unconsumed';
++}
++
+ interface TurnDriver {
+   resolve(response: PromptResponse): void;
+   reject(error: unknown): void;
+@@ -525,6 +533,35 @@ export class AcpSession {
+     return this.driveTurn(content);
+   }
+ 
++  /**
++   * Handle `_session/steering`: inject the blocks into the turn the client's
++   * own `session/prompt` is driving, the same engine path as the TUI's Ctrl-S.
++   * Steering is an operation on an in-flight turn, not another way to start
++   * one, so with no live driver the content is left `unconsumed` and the
++   * client submits it as a normal `session/prompt`, keeping ownership of the
++   * new turn. Slash text is not interpreted here: a steer is plain input.
++   *
++   * The driver check and the engine admission are not atomic. If the turn
++   * ends in between, the engine launches the input as a turn of its own; the
++   * returned turn id then differs from the driver's and the outcome is
++   * `startedNewTurn`, so the client knows no prompt request owns that turn.
++   */
++  async steer(blocks: readonly ContentBlock[]): Promise<SteerResponse> {
++    const driver = this.driver;
++    if (driver === undefined || driver.settled || driver.cancelRequested === true) {
++      return { outcome: 'unconsumed' };
++    }
++    const content = await this.preparePromptContent(blocks);
++    if (content === undefined || driver.settled || this.driver !== driver) {
++      return { outcome: 'unconsumed' };
++    }
++    const launched = await this.agent.steer({ input: content });
++    if (launched !== undefined && driver.turnId !== undefined && launched.turn_id !== driver.turnId) {
++      return { outcome: 'startedNewTurn' };
++    }
++    return { outcome: 'injected' };
++  }
++
+   /**
+    * Convert the ACP blocks to engine content parts and run the input-stage
+    * image compression (see `compressPromptImageParts`). Compression happens
+diff --git a/packages/acp-server/test/steering.test.ts b/packages/acp-server/test/steering.test.ts
+new file mode 100644
+index 0000000..a09b2eb
+--- /dev/null
++++ b/packages/acp-server/test/steering.test.ts
+@@ -0,0 +1,119 @@
++/**
++ * `_session/steering` end to end: the real engine and ACP wire, with only the
++ * LLM call scripted. A Bash approval request is the pause point — the turn is
++ * held inside the tool call until the client answers it, which gives the test
++ * a deterministic moment at which a turn is running.
++ */
++
++import { mkdtemp, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++import { afterEach, describe, expect, it } from 'vitest';
++
++import { createTestClient, type TestClient } from './_helpers/acpClient';
++import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
++import { createScriptedProvider, type ScriptedProvider } from './_helpers/scriptedProvider';
++
++describe('acp-server _session/steering', () => {
++  let homeDir: string | undefined;
++  let client: TestClient | undefined;
++  let scripted: ScriptedProvider | undefined;
++
++  afterEach(async () => {
++    if (client !== undefined) {
++      await client.close();
++      client = undefined;
++    }
++    if (homeDir !== undefined) {
++      await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++      homeDir = undefined;
++    }
++  });
++
++  async function boot(): Promise<{ c: TestClient; init: unknown }> {
++    homeDir = await mkdtemp(join(tmpdir(), 'acp-steering-'));
++    await writeFakeModelConfig(homeDir);
++    scripted = createScriptedProvider();
++    client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
++    const init = await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
++    return { c: client, init };
++  }
++
++  async function newSession(c: TestClient): Promise<string> {
++    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
++      sessionId: string;
++    };
++    await c.waitForSessionUpdate('available_commands_update', 10_000);
++    return created.sessionId;
++  }
++
++  it('advertises steering in the initialize _meta', async () => {
++    const { init } = await boot();
++    expect((init as { _meta?: unknown })._meta).toMatchObject({ steering: { supported: true } });
++  }, 30_000);
++
++  it('leaves the content unconsumed when no turn is running', async () => {
++    const { c } = await boot();
++    const sessionId = await newSession(c);
++
++    const result = await c.send('_session/steering', {
++      sessionId,
++      prompt: [{ type: 'text', text: 'too early' }],
++    });
++
++    expect(result).toEqual({ outcome: 'unconsumed' });
++    expect(scripted!.callCount()).toBe(0);
++  }, 30_000);
++
++  it('injects into the running turn so the next model call sees it', async () => {
++    const { c } = await boot();
++    scripted!.mockNextResponse({
++      type: 'function',
++      id: 'call_1',
++      name: 'Bash',
++      arguments: '{"command":"echo hi"}',
++    });
++    scripted!.mockNextText('changed course');
++
++    let approve!: () => void;
++    const approved = new Promise<void>((resolve) => {
++      approve = resolve;
++    });
++    let permissionAsked!: () => void;
++    const asked = new Promise<void>((resolve) => {
++      permissionAsked = resolve;
++    });
++    c.onRequest('session/request_permission', async () => {
++      permissionAsked();
++      await approved;
++      return { outcome: { outcome: 'selected', optionId: 'approve_once' } };
++    });
++
++    const sessionId = await newSession(c);
++    const promptPromise = c.send('session/prompt', {
++      sessionId,
++      prompt: [{ type: 'text', text: 'run echo' }],
++    });
++    await asked;
++
++    const steered = await c.send('_session/steering', {
++      sessionId,
++      prompt: [{ type: 'text', text: 'STEER-MARKER use printf instead' }],
++    });
++    expect(steered).toEqual({ outcome: 'injected' });
++
++    approve();
++    const result = (await promptPromise) as { stopReason: string };
++    expect(result.stopReason).toBe('end_turn');
++    expect(scripted!.callCount()).toBe(2);
++    expect(JSON.stringify(scripted!.callHistory()[1])).toContain('STEER-MARKER');
++  }, 30_000);
++
++  it('rejects an unknown session', async () => {
++    const { c } = await boot();
++    await expect(
++      c.send('_session/steering', { sessionId: 'session_missing', prompt: [] }),
++    ).rejects.toBeDefined();
++  }, 30_000);
++});
