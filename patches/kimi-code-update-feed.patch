@@ -17,7 +17,7 @@ index eb81c94..409b200 100644
  
  /**
 diff --git a/apps/kimi-code/src/constant/app.ts b/apps/kimi-code/src/constant/app.ts
-index c90b616..a090446 100644
+index 9e57f02..0dd531c 100644
 --- a/apps/kimi-code/src/constant/app.ts
 +++ b/apps/kimi-code/src/constant/app.ts
 @@ -100,25 +100,26 @@ export const FEEDBACK_TELEMETRY_EVENT = 'feedback_submitted';
@@ -57,8 +57,8 @@ index c90b616..a090446 100644
 -  return `${kimiCodeCdnBase()}/binaries`;
 +  return `${KIMI_CODE_BUILDS_RELEASES}/download`;
  }
- // The marketplace env override name lives in the shared agent-core-v2 plugin
- // domain (kap-server consumes it from there). Deep-path import: this module is
+ export {
+   isTrustedPluginMarketplaceUrl as isTrustedKimiCodePluginMarketplace,
 diff --git a/apps/kimi-code/test/cli/update/native-manifest.test.ts b/apps/kimi-code/test/cli/update/native-manifest.test.ts
 index 74f455b..7c56255 100644
 --- a/apps/kimi-code/test/cli/update/native-manifest.test.ts

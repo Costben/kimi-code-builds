@@ -1,5 +1,5 @@
 diff --git a/packages/acp-server/src/server.ts b/packages/acp-server/src/server.ts
-index c2157fa..dc8c658 100644
+index 2c2e1ff..4426bce 100644
 --- a/packages/acp-server/src/server.ts
 +++ b/packages/acp-server/src/server.ts
 @@ -29,6 +29,7 @@ import {
@@ -29,7 +29,7 @@ index c2157fa..dc8c658 100644
      };
    }
  
-@@ -434,6 +438,15 @@ export class AcpServer {
+@@ -435,6 +439,15 @@ export class AcpServer {
      }
    }
  
@@ -45,7 +45,7 @@ index c2157fa..dc8c658 100644
    async cancel(params: CancelNotification): Promise<void> {
      const acpSession = this.sessions.get(params.sessionId);
      if (!acpSession) {
-@@ -662,6 +675,26 @@ export class AcpServer {
+@@ -663,6 +676,27 @@ export class AcpServer {
  /** The custom ACP method name for per-session model selection. */
  const SET_SESSION_MODEL_METHOD = 'session/set_model';
  
@@ -69,24 +69,25 @@ index c2157fa..dc8c658 100644
 +  return { sessionId, prompt: prompt as ContentBlock[] };
 +}
 +
++
  /** Parsed params of the custom `session/set_model` request. */
  export interface SetSessionModelParams {
    readonly sessionId: string;
-@@ -717,7 +750,8 @@ export function createAcpAgentApp(getServer: () => AcpServer): AgentApp {
-     .onNotification(methods.agent.session.cancel, (ctx) => getServer().cancel(ctx.params))
-     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, (ctx) =>
-       getServer().setSessionModel(ctx.params),
--    );
+@@ -726,6 +760,9 @@ export function createAcpAgentApp(getServer: () => AcpServer | Promise<AcpServer
+     )
+     .onRequest(SET_SESSION_MODEL_METHOD, parseSetSessionModelParams, async (ctx) =>
+       (await getServer()).setSessionModel(ctx.params),
 +    )
-+    .onRequest(SESSION_STEERING_METHOD, parseSteerParams, (ctx) => getServer().steer(ctx.params));
++    .onRequest(SESSION_STEERING_METHOD, parseSteerParams, async (ctx) =>
++      (await getServer()).steer(ctx.params),
+     );
  }
  
- /**
 diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
-index 89756ec..0e4cc1c 100644
+index d6e5286..cf062ca 100644
 --- a/packages/acp-server/src/session.ts
 +++ b/packages/acp-server/src/session.ts
-@@ -164,6 +164,14 @@ interface ResolvedCommands {
+@@ -166,6 +166,14 @@ interface ResolvedCommands {
    readonly skillCommandMap: ReadonlyMap<string, string>;
  }
  
@@ -101,7 +102,7 @@ index 89756ec..0e4cc1c 100644
  interface TurnDriver {
    resolve(response: PromptResponse): void;
    reject(error: unknown): void;
-@@ -525,6 +533,35 @@ export class AcpSession {
+@@ -538,6 +546,35 @@ export class AcpSession {
      return this.driveTurn(content);
    }
  
