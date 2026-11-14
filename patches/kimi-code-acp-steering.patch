@@ -84,7 +84,7 @@ index 2c2e1ff..4426bce 100644
  }
  
 diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
-index 95d59c9..41590c7 100644
+index 95d59c9..a607ddb 100644
 --- a/packages/acp-server/src/session.ts
 +++ b/packages/acp-server/src/session.ts
 @@ -166,6 +166,14 @@ interface ResolvedCommands {
@@ -102,7 +102,7 @@ index 95d59c9..41590c7 100644
  interface TurnDriver {
    resolve(response: PromptResponse): void;
    reject(error: unknown): void;
-@@ -539,6 +547,35 @@ export class AcpSession {
+@@ -539,6 +547,43 @@ export class AcpSession {
      return this.driveTurn(content);
    }
  
@@ -129,7 +129,15 @@ index 95d59c9..41590c7 100644
 +      return { outcome: 'unconsumed' };
 +    }
 +    const launched = await this.agent.steer({ input: content });
-+    if (launched !== undefined && driver.turnId !== undefined && launched.turn_id !== driver.turnId) {
++    // A steer into the running turn comes back without `turn_id`; only a turn the
++    // engine had to launch itself carries one, and only a different id means the
++    // driver's turn had already ended when the content arrived.
++    if (
++      launched !== undefined &&
++      launched.turn_id !== undefined &&
++      driver.turnId !== undefined &&
++      launched.turn_id !== driver.turnId
++    ) {
 +      return { outcome: 'startedNewTurn' };
 +    }
 +    return { outcome: 'injected' };
