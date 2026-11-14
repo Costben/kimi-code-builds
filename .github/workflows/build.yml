@@ -209,6 +209,7 @@ jobs:
               echo
               echo "- 基于上游 \`$TAG\` 构建"
               echo "- 支持 ACP 客户端（如 Paseo）在回合运行中插入消息，效果与 Ctrl+S 引导一致"
+              echo "- AskUserQuestion 经 `_meta.questions` 下发完整题目，并接收自由文本与多选答案"
               echo "- 应用内更新改为从本仓库的 Release 获取"
             } > notes.md
             gh release create "$release" --repo "$GITHUB_REPOSITORY" \
