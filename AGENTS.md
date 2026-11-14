@@ -10,7 +10,8 @@ patches; upstream source is checked out fresh in CI for every run.
 
 | patch | 作用 |
 | --- | --- |
-| `kimi-code-acp-steering.patch` | `kimi acp` 新增 `_session/steering`，并在 `initialize` 的 `_meta.steering.supported` 中声明；回合运行中把输入注入该回合（与 TUI 的 Ctrl+S 同一路径），无回合时返回 `unconsumed` 由客户端改发 `session/prompt` |
+| `kimi-code-acp-steering.patch` | `kimi acp` 新增 `_session/steering`，并在 `initialize` 的 `_meta.steering.supported` 中声明；回合运行中把输入注入该回合（与 TUI 的 Ctrl+S 同一路径），无回合时返回 `unconsumed` 由客户端改发 `session/prompt`。同时让引擎的 `notifyClient` 在并入运行中回合后立即返回：它原本要等下一次模型调用把引导 materialize，而工具正在等审批时那一次调用永远不会来 |
+| `kimi-code-acp-question.patch` | `AskUserQuestion` 在 `session/request_permission` 的 `_meta.questions` 里下发完整题目（选项、多选、`allowOther: true`），并从 `_meta.answers` 读回自由文本与多选答案，供 Paseo 这类客户端渲染成带输入框的问题卡 |
 | `kimi-code-update-feed.patch` | 应用内更新（`latest` / `latest.json` / `canary.json` / `manifest.json` / `.zst`）改为读取本仓库的 Release；插件市场、rg、fd 等仍走官方 CDN |
 
 Upstream tracking issue for the steering half: MoonshotAI/kimi-code#2370. Once

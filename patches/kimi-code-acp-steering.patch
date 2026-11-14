@@ -84,7 +84,7 @@ index 2c2e1ff..4426bce 100644
  }
  
 diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
-index d6e5286..cf062ca 100644
+index 95d59c9..41590c7 100644
 --- a/packages/acp-server/src/session.ts
 +++ b/packages/acp-server/src/session.ts
 @@ -166,6 +166,14 @@ interface ResolvedCommands {
@@ -102,7 +102,7 @@ index d6e5286..cf062ca 100644
  interface TurnDriver {
    resolve(response: PromptResponse): void;
    reject(error: unknown): void;
-@@ -538,6 +546,35 @@ export class AcpSession {
+@@ -539,6 +547,35 @@ export class AcpSession {
      return this.driveTurn(content);
    }
  
@@ -263,3 +263,21 @@ index 0000000..a09b2eb
 +    ).rejects.toBeDefined();
 +  }, 30_000);
 +});
+diff --git a/packages/agent-core-v2/src/agent/loop/loopService.ts b/packages/agent-core-v2/src/agent/loop/loopService.ts
+index 64bd7da..0e1483d 100644
+--- a/packages/agent-core-v2/src/agent/loop/loopService.ts
++++ b/packages/agent-core-v2/src/agent/loop/loopService.ts
+@@ -624,6 +624,13 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
+     const queued = status.state === 'running' || status.paused || status.queue.length > 0;
+     const { id } = steerable ? this.sendNow(input) : this.submit(input);
+     const handle = this.promptHandle(id)!;
++    if (steerable) {
++      // A steer joins the running turn, and the loop only materialises it at the
++      // next model call. While a tool sits on an unanswered permission prompt
++      // that call never comes, so awaiting `launched` here parks the caller for
++      // as long as the prompt is open. Report the admission instead.
++      return { prompt_id: id, created_at: handle.createdAt, state: 'running', steered: true };
++    }
+     if (!steerable && queued) {
+       return { prompt_id: id, created_at: handle.createdAt, state: 'queued', steered: false };
+     }

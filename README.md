@@ -8,6 +8,7 @@
   - 返回 `injected`：已并入当前回合
   - 返回 `unconsumed`：当前没有由客户端发起的回合，内容未被使用，请改用 `session/prompt` 发送
   - 返回 `startedNewTurn`：回合恰好在送达前结束，引擎把这条消息作为新回合启动，没有 `session/prompt` 请求负责这个回合
+- **AskUserQuestion 表单**：`kimi acp` 在 `session/request_permission` 的 `_meta.questions` 里下发完整题目（选项、多选、允许自由输入），并从 `_meta.answers` 读回答案。Paseo 这类客户端会渲染成带输入框的问题卡；不认识 `_meta` 的客户端行为不变，仍然只看到选项按钮。
 - **更新源**：`kimi upgrade` 和自动更新从本仓库的 Release 获取，不会被官方版覆盖回去。插件市场、rg、fd 仍然走官方 CDN。
 
 上游需求：[MoonshotAI/kimi-code#2370](https://github.com/MoonshotAI/kimi-code/issues/2370)。上游合入后，ACP 引导补丁会撤掉。
