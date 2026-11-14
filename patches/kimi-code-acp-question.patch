@@ -153,10 +153,21 @@ index 5aff831..eb9e68b 100644
 +  });
  });
 diff --git a/packages/acp-server/test/question.test.ts b/packages/acp-server/test/question.test.ts
-index 3947901..cbb9efa 100644
+index 3947901..8ff9476 100644
 --- a/packages/acp-server/test/question.test.ts
 +++ b/packages/acp-server/test/question.test.ts
-@@ -56,6 +56,79 @@ describe('outcomeToQuestionAnswer', () => {
+@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest';
+ import {
+   elicitationResponseToQuestionAnswers,
+   outcomeToQuestionAnswer,
++  outcomeToQuestionAnswers,
+   questionItemToPermissionOptions,
+   questionRequestToElicitationParams,
++  questionRequestToPermissionMeta,
+ } from '../src/question';
+ 
+ import type { CreateElicitationResponse, RequestPermissionResponse } from '@agentclientprotocol/sdk';
+@@ -56,6 +58,79 @@ describe('outcomeToQuestionAnswer', () => {
    });
  });
  
