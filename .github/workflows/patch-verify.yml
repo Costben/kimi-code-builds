@@ -83,6 +83,8 @@ jobs:
         run: |
           pnpm exec vitest run \
             packages/acp-server/test/steering.test.ts \
+            packages/acp-server/test/question.test.ts \
+            packages/acp-server/test/interaction-bridge.test.ts \
             packages/acp-server/test/initialize.test.ts \
             packages/acp-server/test/e2e-turn.test.ts \
             apps/kimi-code/test/cli/update/cdn.test.ts \

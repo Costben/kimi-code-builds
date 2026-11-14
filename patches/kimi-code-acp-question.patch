@@ -1,0 +1,238 @@
+diff --git a/packages/acp-server/src/interaction-bridge.ts b/packages/acp-server/src/interaction-bridge.ts
+index d57e79e..444e145 100644
+--- a/packages/acp-server/src/interaction-bridge.ts
++++ b/packages/acp-server/src/interaction-bridge.ts
+@@ -35,9 +35,10 @@ import { acpToolCallId } from './events-map';
+ import { log } from './log';
+ import {
+   elicitationResponseToQuestionAnswers,
+-  outcomeToQuestionAnswer,
++  outcomeToQuestionAnswers,
+   questionItemToPermissionOptions,
+   questionRequestToElicitationParams,
++  questionRequestToPermissionMeta,
+ } from './question';
+ 
+ export class AcpInteractionBridge {
+@@ -218,8 +219,9 @@ export class AcpInteractionBridge {
+           title: 'AskUserQuestion',
+           content: [{ type: 'content', content: { type: 'text', text: q.question } }],
+         },
++        _meta: questionRequestToPermissionMeta(questions),
+       });
+-      return outcomeToQuestionAnswer(q, response);
++      return outcomeToQuestionAnswers(questions, response);
+     } catch (error) {
+       log.warn('acp: requestPermission (question) failed; dismissing', {
+         sessionId: this.sessionId,
+diff --git a/packages/acp-server/src/question.ts b/packages/acp-server/src/question.ts
+index 838954d..eda182a 100644
+--- a/packages/acp-server/src/question.ts
++++ b/packages/acp-server/src/question.ts
+@@ -92,6 +92,70 @@ export function outcomeToQuestionAnswer(
+   return { [question.question]: selected.label };
+ }
+ 
++function isPlainRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++/**
++ * Attach the full question metadata (all questions, headers, descriptions,
++ * `multiSelect`, and `allowOther: true`) onto `session/request_permission._meta`
++ * so ACP clients that render a rich question form on `request_permission`
++ * (such as Paseo) can accept multi-question, multi-select, and free-text
++ * "Other" answers without advertising `elicitation.form`.
++ */
++export function questionRequestToPermissionMeta(
++  questions: readonly QuestionItem[],
++): Record<string, unknown> {
++  return {
++    questions: questions.map((q) => ({
++      question: q.question,
++      ...(q.header !== undefined ? { header: q.header } : {}),
++      ...(q.body !== undefined ? { body: q.body } : {}),
++      options: q.options.map((opt) => ({
++        label: opt.label,
++        ...(opt.description !== undefined ? { description: opt.description } : {}),
++      })),
++      ...(q.multiSelect !== undefined ? { multiSelect: q.multiSelect } : {}),
++      allowOther: true,
++    })),
++  };
++}
++
++/**
++ * Reverse-map an ACP {@link RequestPermissionResponse} for a full question set.
++ * Prefers `_meta.answers` (from either `response._meta` or
++ * `response.outcome._meta`, keyed by question text or header) so clients can
++ * return free-text "Other", multi-select, and multi-question answers; falls
++ * back to {@link outcomeToQuestionAnswer} for legacy option-only clients.
++ */
++export function outcomeToQuestionAnswers(
++  questions: readonly QuestionItem[],
++  response: RequestPermissionResponse,
++): QuestionAnswers | null {
++  if (questions.length === 0) return null;
++  if (response.outcome.outcome === 'cancelled') return null;
++  if (response.outcome.optionId === skipOptionId(0)) return null;
++
++  const responseMeta = isPlainRecord(response._meta) ? response._meta : undefined;
++  const outcomeMeta = isPlainRecord((response.outcome as Record<string, unknown>)['_meta'])
++    ? ((response.outcome as Record<string, unknown>)['_meta'] as Record<string, unknown>)
++    : undefined;
++  const rawAnswers = responseMeta?.['answers'] ?? outcomeMeta?.['answers'];
++  if (isPlainRecord(rawAnswers)) {
++    const answers: QuestionAnswers = {};
++    for (const q of questions) {
++      const candidate =
++        rawAnswers[q.question] ?? (q.header !== undefined ? rawAnswers[q.header] : undefined);
++      if (typeof candidate === 'string' && candidate.trim().length > 0) {
++        answers[q.question] = candidate.trim();
++      }
++    }
++    return Object.keys(answers).length > 0 ? answers : null;
++  }
++
++  return outcomeToQuestionAnswer(questions[0]!, response);
++}
++
+ // ---------------------------------------------------------------------------
+ // Elicitation bridge (`elicitation/create`, form mode)
+ // ---------------------------------------------------------------------------
+diff --git a/packages/acp-server/test/interaction-bridge.test.ts b/packages/acp-server/test/interaction-bridge.test.ts
+index 5aff831..eb9e68b 100644
+--- a/packages/acp-server/test/interaction-bridge.test.ts
++++ b/packages/acp-server/test/interaction-bridge.test.ts
+@@ -365,4 +365,47 @@ describe('AcpInteractionBridge', () => {
+     expect(session.responses).toEqual([{ id: 'question-el-1', response: { 'Pick one': 'B' } }]);
+     bridge.dispose();
+   });
++
++  it('attaches full question metadata on requestPermission and accepts _meta.answers', async () => {
++    const session = makeFakeSession();
++    const { conn, calls } = makeFakeConn(() => ({
++      outcome: { outcome: 'selected', optionId: 'q0_opt_0' },
++      _meta: {
++        answers: {
++          One: 'Custom answer',
++          'Pick many': 'X, Custom extra',
++        },
++      },
++    }));
++    session.setPending([questionInteraction]);
++    const bridge = new AcpInteractionBridge(conn, session.handle, SESSION_ID);
++    await flush();
++
++    expect(calls[0]).toMatchObject({
++      toolCall: { toolCallId: '5:tc_q', title: 'AskUserQuestion' },
++      _meta: {
++        questions: [
++          {
++            question: 'Pick one',
++            header: 'One',
++            options: [{ label: 'A' }, { label: 'B' }],
++            allowOther: true,
++          },
++          {
++            question: 'Pick many',
++            options: [{ label: 'X' }, { label: 'Y' }, { label: 'Z' }],
++            multiSelect: true,
++            allowOther: true,
++          },
++        ],
++      },
++    });
++    expect(session.responses).toEqual([
++      {
++        id: 'question-el-1',
++        response: { 'Pick one': 'Custom answer', 'Pick many': 'X, Custom extra' },
++      },
++    ]);
++    bridge.dispose();
++  });
+ });
+diff --git a/packages/acp-server/test/question.test.ts b/packages/acp-server/test/question.test.ts
+index 3947901..cbb9efa 100644
+--- a/packages/acp-server/test/question.test.ts
++++ b/packages/acp-server/test/question.test.ts
+@@ -56,6 +56,79 @@ describe('outcomeToQuestionAnswer', () => {
+   });
+ });
+ 
++describe('questionRequestToPermissionMeta', () => {
++  it('serializes all questions with options, descriptions, multiSelect and allowOther', () => {
++    const meta = questionRequestToPermissionMeta([sampleQuestion, multiQuestion]);
++    expect(meta).toEqual({
++      questions: [
++        {
++          question: 'Pick a color',
++          options: [{ label: 'Red' }, { label: 'Green' }, { label: 'Blue' }],
++          allowOther: true,
++        },
++        {
++          question: 'Pick features',
++          header: 'Features',
++          options: [
++            { label: 'Auth', description: 'Login + signup' },
++            { label: 'Email' },
++            { label: 'Uploads' },
++          ],
++          multiSelect: true,
++          allowOther: true,
++        },
++      ],
++    });
++  });
++});
++
++describe('outcomeToQuestionAnswers', () => {
++  it('accepts free-text and multi-question answers from response._meta.answers', () => {
++    const response: RequestPermissionResponse = {
++      outcome: { outcome: 'selected', optionId: 'q0_opt_0' },
++      _meta: {
++        answers: {
++          'Pick a color': 'Custom purple',
++          Features: 'Auth, Custom SSO',
++        },
++      },
++    };
++    expect(outcomeToQuestionAnswers([sampleQuestion, multiQuestion], response)).toEqual({
++      'Pick a color': 'Custom purple',
++      'Pick features': 'Auth, Custom SSO',
++    });
++  });
++
++  it('also reads _meta.answers from outcome._meta', () => {
++    const response: RequestPermissionResponse = {
++      outcome: {
++        outcome: 'selected',
++        optionId: 'q0_opt_0',
++        _meta: { answers: { 'Pick a color': 'Teal' } },
++      },
++    };
++    expect(outcomeToQuestionAnswers([sampleQuestion], response)).toEqual({
++      'Pick a color': 'Teal',
++    });
++  });
++
++  it('returns null on skip or cancel even if _meta is absent or present', () => {
++    expect(
++      outcomeToQuestionAnswers([sampleQuestion], {
++        outcome: { outcome: 'selected', optionId: 'q0_skip' },
++        _meta: { answers: { 'Pick a color': 'Red' } },
++      }),
++    ).toBeNull();
++    expect(outcomeToQuestionAnswers([sampleQuestion], cancelled)).toBeNull();
++  });
++
++  it('falls back to optionId when _meta.answers is absent', () => {
++    expect(outcomeToQuestionAnswers([sampleQuestion], selected('q0_opt_2'))).toEqual({
++      'Pick a color': 'Blue',
++    });
++  });
++});
++
+ const multiQuestion: QuestionItem = {
+   question: 'Pick features',
+   header: 'Features',
