@@ -1,14 +1,14 @@
 diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
 --- a/packages/acp-server/src/session.ts
 +++ b/packages/acp-server/src/session.ts
-@@ -78,6 +78,7 @@
-   toolCallStartToSessionUpdate,
-   toolUpdatedToSessionUpdate,
-   toolResultToSessionUpdate,
-+  type TurnEndReason,
-   turnEndReasonToStopReason,
-   usageUpdateNotification,
-   isAuthError,
+@@ -50,6 +50,7 @@
+   ToolCallStartedEvent,
+   ToolUpdatedEvent,
+ } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
++import type { TurnEndReason } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
+ import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
+ 
+ import type { AcpClient } from './acp-client';
 @@ -108,6 +109,16 @@
  const SESSION_STALE_CODE = 'session.stale';
  
