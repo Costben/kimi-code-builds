@@ -1,0 +1,362 @@
+diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/session.ts
+--- a/packages/acp-server/src/session.ts
++++ b/packages/acp-server/src/session.ts
+@@ -78,6 +78,7 @@
+   toolCallStartToSessionUpdate,
+   toolUpdatedToSessionUpdate,
+   toolResultToSessionUpdate,
++  type TurnEndReason,
+   turnEndReasonToStopReason,
+   usageUpdateNotification,
+   isAuthError,
+@@ -108,6 +109,16 @@
+ const SESSION_STALE_CODE = 'session.stale';
+ 
+ /**
++ * How long a `completed` turn is held before the client prompt is answered.
++ * A background task that finishes right as the turn ends is admitted by the
++ * engine as a turn of its own, a tick after `turn.ended`; the window absorbs
++ * that in-process hop so both turns answer as one.
++ */
++const CONTINUATION_GRACE_MS = 250;
++/** Safety cap: a notification storm must never leave `session/prompt` unanswered. */
++const MAX_CHAINED_TURNS = 64;
++
++/**
+  * Map a prompt-launch rejection (from `agent.prompt` / `agent.activateSkill`)
+  * to the JSON-RPC error the client sees.
+  *
+@@ -199,6 +210,23 @@
+    * the same verdict the live path would have given.
+    */
+   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
++  /**
++   * Set while a `completed` turn waits out {@link CONTINUATION_GRACE_MS} for a
++   * follow-up turn of the engine's own. A finished background task is admitted
++   * as a fresh engine turn; answering the moment the client's turn ends would
++   * cut the agent's work in half and leave that follow-up turn with no driver
++   * to attribute its events to — the client shows "done" while the agent keeps
++   * working, and none of that work reaches it.
++   */
++  awaiting?: TurnEndSnapshot & { readonly timer: ReturnType<typeof setTimeout> };
++  /** Follow-up turns folded into this driver so far; bounded by {@link MAX_CHAINED_TURNS}. */
++  chained?: number;
++}
++
++/** What a finished turn would settle with once no follow-up turn takes over. */
++interface TurnEndSnapshot {
++  readonly reason: TurnEndReason;
++  readonly error: { readonly code: string; readonly message?: string } | undefined;
+ }
+ 
+ export class AcpSession {
+@@ -333,6 +361,9 @@
+           this.onToolResult(event);
+         });
+       }),
++      events.on('turn.started', (event) => {
++        this.onTurnStarted(event);
++      }),
+       events.on('turn.ended', (event) => {
+         this.dispatchTurnEvent(event.turnId, () => {
+           this.onTurnEnded(event);
+@@ -705,12 +736,19 @@
+    * two concurrent prompts cannot race past the check.
+    */
+   private assertNoActiveTurn(): void {
+-    if (this.driver !== undefined && !this.driver.settled) {
+-      throw RequestError.invalidRequest(
+-        { code: TURN_AGENT_BUSY_CODE },
+-        'another turn is already in progress',
+-      );
++    const driver = this.driver;
++    if (driver === undefined || driver.settled) return;
++    if (driver.awaiting !== undefined) {
++      // The finished turn is only being held open for a possible follow-up.
++      // A client that already submits its next prompt wins the race: answer
++      // the old prompt now and hand the session to the new one.
++      this.finishDriver(driver, driver.awaiting.reason, driver.awaiting.error);
++      return;
+     }
++    throw RequestError.invalidRequest(
++      { code: TURN_AGENT_BUSY_CODE },
++      'another turn is already in progress',
++    );
+   }
+ 
+   /**
+@@ -764,9 +802,7 @@
+           // Replay the events the turn emitted before its id arrived (a fast
+           // turn can outrun the launch round-trip — `activateSkill` returns
+           // only after the prompt-metadata update).
+-          for (const early of driver.early.splice(0)) {
+-            if (early.turnId === driver.turnId) early.dispatch();
+-          }
++          this.flushEarly(driver);
+         },
+         (error) => {
+           this.settleDriver(driver, () => {
+@@ -783,7 +819,13 @@
+    */
+   private dispatchTurnEvent(turnId: number, dispatch: () => void): void {
+     const driver = this.driver;
+-    if (driver !== undefined && !driver.settled && driver.turnId === undefined) {
++    if (
++      driver !== undefined &&
++      !driver.settled &&
++      (driver.turnId === undefined || driver.awaiting !== undefined)
++    ) {
++      // No id yet, or the id is stale because a follow-up turn may take over.
++      // Either way the event belongs to a turn this driver can still adopt.
+       driver.early.push({ turnId, dispatch });
+       return;
+     }
+@@ -791,16 +833,34 @@
+   }
+ 
+   /**
++   * Replay the buffered events of the turn the driver now owns. Entries of any
++   * other turn are dropped — the same verdict the live path would give.
++   */
++  private flushEarly(driver: TurnDriver): void {
++    for (const early of driver.early.splice(0)) {
++      if (early.turnId === driver.turnId) early.dispatch();
++    }
++  }
++
++  /**
+    * Settle the driver exactly once and detach it from the session so later
+    * events of its turn are ignored.
+    */
+   private settleDriver(driver: TurnDriver, action: () => void): void {
+     if (driver.settled) return;
+     driver.settled = true;
++    this.clearAwaiting(driver);
+     if (this.driver === driver) this.driver = undefined;
+     action();
+   }
+ 
++  private clearAwaiting(driver: TurnDriver): void {
++    const awaiting = driver.awaiting;
++    if (awaiting === undefined) return;
++    driver.awaiting = undefined;
++    clearTimeout(awaiting.timer);
++  }
++
+   /** The active driver, but only for events of ITS turn. */
+   private driverFor(turnId: number): TurnDriver | undefined {
+     const driver = this.driver;
+@@ -989,14 +1049,48 @@
+     const driver = this.driverFor(event.turnId);
+     if (driver === undefined) return;
+     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
++    // Only a clean completion can be followed by a turn of the engine's own,
++    // and only while the chain cap has room left.
++    if (event.reason !== 'completed' || (driver.chained ?? 0) >= MAX_CHAINED_TURNS) {
++      this.finishDriver(driver, event.reason, error);
++      return;
++    }
++    this.clearAwaiting(driver);
++    const timer = setTimeout(() => {
++      driver.awaiting = undefined;
++      this.finishDriver(driver, event.reason, error);
++    }, CONTINUATION_GRACE_MS);
++    (timer as { unref?: () => void }).unref?.();
++    driver.awaiting = { reason: event.reason, error, timer };
++  }
++
++  /**
++   * Fold a follow-up turn into the client's prompt. The engine starts it for a
++   * background task that finished while the client's turn was ending, so the
++   * client sees one continuous turn instead of "done, then working again".
++   */
++  private onTurnStarted(event: AgentEventPayloads['turn.started']): void {
++    const driver = this.driver;
++    if (driver === undefined || driver.settled || driver.awaiting === undefined) return;
++    if (driver.turnId === event.turnId) return;
++    const origin = event.origin as { readonly kind?: string } | undefined;
++    if (origin?.kind !== 'task') return;
++    driver.chained = (driver.chained ?? 0) + 1;
++    this.clearAwaiting(driver);
++    driver.turnId = event.turnId;
++    this.flushEarly(driver);
++  }
++
++  /** Answer the client's prompt with the outcome of the turn it owns. */
++  private finishDriver(driver: TurnDriver, reason: TurnEndReason, error: TurnEndSnapshot['error']): void {
+     this.settleDriver(driver, () => {
+       // Auth failures must surface as a JSON-RPC `auth_required` error
+       // so the client triggers its re-auth flow, not a silent `end_turn`.
+-      if (event.reason === 'failed' && isAuthError(error)) {
++      if (reason === 'failed' && isAuthError(error)) {
+         driver.reject(RequestError.authRequired(undefined, error?.message));
+         return;
+       }
+-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
++      driver.resolve({ stopReason: turnEndReasonToStopReason(reason, error) });
+     });
+     void this.emitUsageUpdate();
+   }
+@@ -1064,6 +1158,18 @@
+     }
+     const driver = this.driver;
+     if (driver === undefined || driver.settled) return;
++    if (driver.awaiting !== undefined) {
++      // The client's turn already ended; anything still running belongs to a
++      // follow-up turn. Stop whatever is active and answer straight away.
++      this.finishDriver(driver, 'cancelled', undefined);
++      void this.agent.cancel().catch((error) => {
++        log.warn('acp: cancel (follow-up turn) failed', {
++          sessionId: this.sessionId,
++          error: error instanceof Error ? error.message : String(error),
++        });
++      });
++      return;
++    }
+     const turnId = driver.turnId;
+     if (turnId === undefined) {
+       // The launch round-trip has not returned the turn id yet. The engine's
+diff --git a/packages/acp-server/test/turn-continuation.test.ts b/packages/acp-server/test/turn-continuation.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/acp-server/test/turn-continuation.test.ts
+@@ -0,0 +1,139 @@
++/**
++ * A background task that finishes while the client's turn is ending is
++ * delivered by the engine as a turn of its own, a tick after `turn.ended`.
++ * The in-flight `session/prompt` must stay open across that hand-off: answering
++ * the moment the first turn ends leaves the follow-up turn with no driver, so
++ * its events are dropped and the client shows "done" while the agent silently
++ * keeps working.
++ */
++
++import { mkdtemp, rm } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++
++import {
++  getLiveSessionById,
++  IAgentLifecycleService,
++  IAgentLoopService,
++} from '@moonshot-ai/agent-core-v2';
++import { afterEach, describe, expect, it } from 'vitest';
++
++import { createTestClient, type TestClient } from './_helpers/acpClient';
++import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
++import { createScriptedProvider, type ScriptedProvider } from './_helpers/scriptedProvider';
++
++interface SessionUpdate {
++  readonly sessionUpdate?: string;
++  readonly content?: { readonly text?: string };
++}
++
++function assistantText(c: TestClient): string {
++  return c
++    .sessionUpdates()
++    .flatMap((message) => {
++      const update = (message.params as { update?: SessionUpdate }).update;
++      return update?.sessionUpdate === 'agent_message_chunk' ? [update.content?.text ?? ''] : [];
++    })
++    .join('');
++}
++
++async function waitFor(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
++  const deadline = Date.now() + timeoutMs;
++  while (Date.now() < deadline) {
++    if (predicate()) return;
++    await new Promise((resolve) => setTimeout(resolve, 20));
++  }
++  throw new Error('timed out waiting for a condition');
++}
++
++describe('acp-server turn continuation', () => {
++  let homeDir: string | undefined;
++  let client: TestClient | undefined;
++  let scripted: ScriptedProvider | undefined;
++
++  afterEach(async () => {
++    if (client !== undefined) {
++      await client.close();
++      client = undefined;
++    }
++    if (homeDir !== undefined) {
++      await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
++      homeDir = undefined;
++    }
++  });
++
++  async function boot(): Promise<TestClient> {
++    homeDir = await mkdtemp(join(tmpdir(), 'acp-continuation-'));
++    await writeFakeModelConfig(homeDir);
++    scripted = createScriptedProvider();
++    client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
++    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
++    return client;
++  }
++
++  async function newSession(c: TestClient): Promise<string> {
++    const created = (await c.send('session/new', { cwd: homeDir, mcpServers: [] })) as {
++      sessionId: string;
++    };
++    await c.waitForSessionUpdate('available_commands_update', 10_000);
++    return created.sessionId;
++  }
++
++  it('keeps the prompt open across the turn a task notification starts', async () => {
++    const c = await boot();
++    scripted!.mockNextText('first done');
++    scripted!.mockNextText('followed up');
++
++    const sessionId = await newSession(c);
++    let resolved = false;
++    const promptPromise = c
++      .send('session/prompt', { sessionId, prompt: [{ type: 'text', text: 'say first' }] })
++      .then((result) => {
++        resolved = true;
++        return result;
++      });
++
++    await waitFor(() => assistantText(c).includes('first done'));
++
++    const session = getLiveSessionById(c.server.core.accessor, sessionId);
++    const loop = session?.accessor.get(IAgentLifecycleService).handleOf('main')?.accessor.get(IAgentLoopService);
++    expect(loop).toBeDefined();
++    loop!.notify({
++      message: {
++        role: 'user',
++        content: [{ type: 'text', text: 'BG-TASK-DONE the background task finished' }],
++        origin: {
++          kind: 'task',
++          taskId: 'bash-cont0001',
++          status: 'completed',
++          notificationId: 'task:bash-cont0001:completed',
++        },
++      },
++    });
++
++    await waitFor(() => assistantText(c).includes('followed up'));
++    expect(resolved).toBe(false);
++
++    const result = (await promptPromise) as { stopReason: string };
++    expect(result.stopReason).toBe('end_turn');
++    expect(scripted!.callCount()).toBe(2);
++    expect(JSON.stringify(scripted!.callHistory()[1])).toContain('BG-TASK-DONE');
++    expect(assistantText(c)).toContain('followed up');
++  }, 40_000);
++
++  it('answers as soon as the turn ends when nothing follows it', async () => {
++    const c = await boot();
++    scripted!.mockNextText('only done');
++
++    const sessionId = await newSession(c);
++    const startedAt = Date.now();
++    const result = (await c.send('session/prompt', {
++      sessionId,
++      prompt: [{ type: 'text', text: 'say only' }],
++    })) as { stopReason: string };
++
++    expect(result.stopReason).toBe('end_turn');
++    expect(Date.now() - startedAt).toBeLessThan(15_000);
++    expect(scripted!.callCount()).toBe(1);
++  }, 40_000);
++});

@@ -83,6 +83,7 @@ jobs:
         run: |
           pnpm exec vitest run \
             packages/acp-server/test/steering.test.ts \
+            packages/acp-server/test/turn-continuation.test.ts \
             packages/acp-server/test/question.test.ts \
             packages/acp-server/test/interaction-bridge.test.ts \
             packages/acp-server/test/initialize.test.ts \
