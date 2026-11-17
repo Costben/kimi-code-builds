@@ -11,7 +11,7 @@ patches; upstream source is checked out fresh in CI for every run.
 | patch | 作用 |
 | --- | --- |
 | `kimi-code-acp-steering.patch` | `kimi acp` 新增 `_session/steering`，并在 `initialize` 的 `_meta.steering.supported` 中声明；回合运行中把输入注入该回合（与 TUI 的 Ctrl+S 同一路径），无回合时返回 `unconsumed` 由客户端改发 `session/prompt`。同时让引擎的 `notifyClient` 在并入运行中回合后立即返回：它原本要等下一次模型调用把引导 materialize，而工具正在等审批时那一次调用永远不会来 |
-| `kimi-code-acp-turn-continuation.patch` | 客户端那一轮结束后，引擎会为「后台任务完成」再开一个自己发起的回合；这些回合没有 driver，其 `session/update` 全被丢弃，客户端只看到「完成了」而后续工作在协议层隐形。补丁在 `turn.ended` 后保留 250 ms 宽限，接住紧随其后的 task 通知回合（`origin.kind === 'task'`），把整段工作当作同一个 `session/prompt` 流式发完再作答 |
+| `kimi-code-acp-turn-continuation.patch` | 客户端那一轮结束后，引擎会为「后台任务完成」再开一个自己发起的回合；这些回合没有 driver，其 `session/update` 全被丢弃，客户端只看到「完成了」而后续工作在协议层隐形。补丁在 `turn.ended` 时探测本回合遗留的后台任务：还有会回报通知的任务在跑就挂住（看门狗 10 分钟），没有就只留 250 ms 宽限；接住随后的 task 通知回合（`origin.kind === 'task'`）后把整段工作当作同一个 `session/prompt` 流式发完再作答 |
 | `kimi-code-acp-question.patch` | `AskUserQuestion` 在 `session/request_permission` 的 `_meta.questions` 里下发完整题目（选项、多选、`allowOther: true`），并从 `_meta.answers` 读回自由文本与多选答案，供 Paseo 这类客户端渲染成带输入框的问题卡 |
 | `kimi-code-update-feed.patch` | 应用内更新（`latest` / `latest.json` / `canary.json` / `manifest.json` / `.zst`）改为读取本仓库的 Release；插件市场、rg、fd 等仍走官方 CDN |
 

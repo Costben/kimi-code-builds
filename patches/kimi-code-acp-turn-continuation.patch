@@ -9,16 +9,26 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
  import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
  
  import type { AcpClient } from './acp-client';
-@@ -108,6 +109,16 @@
+@@ -108,6 +109,26 @@
  const SESSION_STALE_CODE = 'session.stale';
  
  /**
-+ * How long a `completed` turn is held before the client prompt is answered.
-+ * A background task that finishes right as the turn ends is admitted by the
-+ * engine as a turn of its own, a tick after `turn.ended`; the window absorbs
-+ * that in-process hop so both turns answer as one.
++ * How long a `completed` turn with no background work left is held before the
++ * client prompt is answered. A background task that finishes right as the turn
++ * ends is admitted by the engine as a turn of its own, a tick after
++ * `turn.ended`; the window absorbs that in-process hop so both turns answer as
++ * one.
 + */
 +const CONTINUATION_GRACE_MS = 250;
++/**
++ * How long a `completed` turn is held while a background task it started is
++ * still running. The engine opens the follow-up turn only when that task
++ * terminates — seconds or minutes after `turn.ended` — so the fixed grace above
++ * cannot cover it, and answering early shows the client "done" while the agent
++ * keeps working. The watchdog only guards a task that dies without a
++ * notification.
++ */
++const MAX_CONTINUATION_HOLD_MS = 10 * 60_000;
 +/** Safety cap: a notification storm must never leave `session/prompt` unanswered. */
 +const MAX_CHAINED_TURNS = 64;
 +
@@ -26,21 +36,26 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
   * Map a prompt-launch rejection (from `agent.prompt` / `agent.activateSkill`)
   * to the JSON-RPC error the client sees.
   *
-@@ -199,6 +210,23 @@
+@@ -199,6 +220,28 @@
     * the same verdict the live path would have given.
     */
    early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
 +  /**
-+   * Set while a `completed` turn waits out {@link CONTINUATION_GRACE_MS} for a
-+   * follow-up turn of the engine's own. A finished background task is admitted
-+   * as a fresh engine turn; answering the moment the client's turn ends would
-+   * cut the agent's work in half and leave that follow-up turn with no driver
-+   * to attribute its events to — the client shows "done" while the agent keeps
-+   * working, and none of that work reaches it.
++   * Set while a `completed` turn is held for a follow-up turn of the engine's
++   * own. A finished background task is admitted as a fresh engine turn, when it
++   * terminates rather than when the client's turn ends; answering in between
++   * would cut the agent's work in half and leave that follow-up turn with no
++   * driver to attribute its events to — the client shows "done" while the agent
++   * keeps working, and none of that work reaches it.
 +   */
 +  awaiting?: TurnEndSnapshot & { readonly timer: ReturnType<typeof setTimeout> };
 +  /** Follow-up turns folded into this driver so far; bounded by {@link MAX_CHAINED_TURNS}. */
 +  chained?: number;
++  /**
++   * Background tasks whose termination has already opened a follow-up turn for
++   * this driver. They must not hold it open a second time.
++   */
++  notified?: Set<string>;
 +}
 +
 +/** What a finished turn would settle with once no follow-up turn takes over. */
@@ -50,7 +65,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
  }
  
  export class AcpSession {
-@@ -333,6 +361,9 @@
+@@ -333,6 +376,9 @@
            this.onToolResult(event);
          });
        }),
@@ -60,7 +75,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
        events.on('turn.ended', (event) => {
          this.dispatchTurnEvent(event.turnId, () => {
            this.onTurnEnded(event);
-@@ -705,12 +736,19 @@
+@@ -705,12 +751,19 @@
     * two concurrent prompts cannot race past the check.
     */
    private assertNoActiveTurn(): void {
@@ -85,7 +100,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
    }
  
    /**
-@@ -764,9 +802,7 @@
+@@ -764,9 +817,7 @@
            // Replay the events the turn emitted before its id arrived (a fast
            // turn can outrun the launch round-trip — `activateSkill` returns
            // only after the prompt-metadata update).
@@ -96,7 +111,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
          },
          (error) => {
            this.settleDriver(driver, () => {
-@@ -783,7 +819,13 @@
+@@ -783,7 +834,13 @@
     */
    private dispatchTurnEvent(turnId: number, dispatch: () => void): void {
      const driver = this.driver;
@@ -111,7 +126,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
        driver.early.push({ turnId, dispatch });
        return;
      }
-@@ -791,16 +833,34 @@
+@@ -791,16 +848,34 @@
    }
  
    /**
@@ -146,7 +161,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
    /** The active driver, but only for events of ITS turn. */
    private driverFor(turnId: number): TurnDriver | undefined {
      const driver = this.driver;
-@@ -989,14 +1049,48 @@
+@@ -989,14 +1064,111 @@
      const driver = this.driverFor(event.turnId);
      if (driver === undefined) return;
      const error = event.error as { readonly code: string; readonly message?: string } | undefined;
@@ -157,12 +172,72 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
 +      return;
 +    }
 +    this.clearAwaiting(driver);
++    const snapshot: TurnEndSnapshot = { reason: event.reason, error };
++    const awaiting = { ...snapshot, timer: this.armHold(driver, snapshot, MAX_CONTINUATION_HOLD_MS) };
++    driver.awaiting = awaiting;
++    void this.releaseHoldWithoutLiveTask(driver, awaiting);
++  }
++
++  /**
++   * Start the watchdog that answers the held prompt once `delayMs` elapses.
++   * {@link clearAwaiting} disarms it when a follow-up turn takes over first.
++   */
++  private armHold(
++    driver: TurnDriver,
++    snapshot: TurnEndSnapshot,
++    delayMs: number,
++  ): ReturnType<typeof setTimeout> {
 +    const timer = setTimeout(() => {
++      if (driver.awaiting?.timer !== timer) return;
 +      driver.awaiting = undefined;
-+      this.finishDriver(driver, event.reason, error);
-+    }, CONTINUATION_GRACE_MS);
++      this.finishDriver(driver, snapshot.reason, snapshot.error);
++    }, delayMs);
 +    (timer as { unref?: () => void }).unref?.();
-+    driver.awaiting = { reason: event.reason, error, timer };
++    return timer;
++  }
++
++  /**
++   * Drop back to {@link CONTINUATION_GRACE_MS} when the turn left no background
++   * work behind: nothing will open a follow-up turn, so holding it longer only
++   * delays the client's answer.
++   */
++  private async releaseHoldWithoutLiveTask(
++    driver: TurnDriver,
++    awaiting: TurnEndSnapshot & { readonly timer: ReturnType<typeof setTimeout> },
++  ): Promise<void> {
++    let live: boolean;
++    try {
++      live = await this.hasLiveContinuationTask(driver);
++    } catch (error) {
++      log.warn('acp: background task probe failed; falling back to the grace window', {
++        sessionId: this.sessionId,
++        error: error instanceof Error ? error.message : String(error),
++      });
++      live = false;
++    }
++    if (live || driver.awaiting !== awaiting) return;
++    clearTimeout(awaiting.timer);
++    driver.awaiting = {
++      ...awaiting,
++      timer: this.armHold(driver, awaiting, CONTINUATION_GRACE_MS),
++    };
++  }
++
++  /**
++   * Whether the turn left background work whose termination will open a
++   * follow-up turn. A task reports back only when its terminal notification is
++   * neither suppressed nor detached away, and a task that already woke this
++   * driver has reported once — waiting for it again would outlive its
++   * notification.
++   */
++  private async hasLiveContinuationTask(driver: TurnDriver): Promise<boolean> {
++    const tasks = await this.agent.getTasks({ activeOnly: true });
++    return tasks.some(
++      (task) =>
++        task.detached !== false &&
++        task.terminalNotificationSuppressed !== true &&
++        driver.notified?.has(task.taskId) !== true,
++    );
 +  }
 +
 +  /**
@@ -174,9 +249,12 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
 +    const driver = this.driver;
 +    if (driver === undefined || driver.settled || driver.awaiting === undefined) return;
 +    if (driver.turnId === event.turnId) return;
-+    const origin = event.origin as { readonly kind?: string } | undefined;
++    const origin = event.origin as
++      | { readonly kind?: string; readonly taskId?: string }
++      | undefined;
 +    if (origin?.kind !== 'task') return;
 +    driver.chained = (driver.chained ?? 0) + 1;
++    if (origin.taskId !== undefined) (driver.notified ??= new Set()).add(origin.taskId);
 +    this.clearAwaiting(driver);
 +    driver.turnId = event.turnId;
 +    this.flushEarly(driver);
@@ -197,7 +275,7 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
      });
      void this.emitUsageUpdate();
    }
-@@ -1064,6 +1158,18 @@
+@@ -1064,6 +1236,18 @@
      }
      const driver = this.driver;
      if (driver === undefined || driver.settled) return;
@@ -218,9 +296,10 @@ diff --git a/packages/acp-server/src/session.ts b/packages/acp-server/src/sessio
        // The launch round-trip has not returned the turn id yet. The engine's
 diff --git a/packages/acp-server/test/turn-continuation.test.ts b/packages/acp-server/test/turn-continuation.test.ts
 new file mode 100644
+index 0000000..1111111
 --- /dev/null
 +++ b/packages/acp-server/test/turn-continuation.test.ts
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,182 @@
 +/**
 + * A background task that finishes while the client's turn is ending is
 + * delivered by the engine as a turn of its own, a tick after `turn.ended`.
@@ -343,6 +422,49 @@ new file mode 100644
 +    expect(JSON.stringify(scripted!.callHistory()[1])).toContain('BG-TASK-DONE');
 +    expect(assistantText(c)).toContain('followed up');
 +  }, 40_000);
++
++  it('keeps the prompt open while a background task it started is still running', async () => {
++    const c = await boot();
++    // The model starts a background command, answers, and leaves the result to
++    // the completion notification — which arrives only when the command ends,
++    // far outside the in-process grace window.
++    scripted!.mockNextResponse({
++      type: 'function',
++      id: 'call_bg',
++      name: 'Bash',
++      arguments: JSON.stringify({
++        command: 'sleep 3; echo BG_DONE',
++        run_in_background: true,
++        description: 'bg sleep',
++      }),
++    });
++    scripted!.mockNextText('waiting');
++    scripted!.mockNextText('picked it up');
++
++    c.onRequest('session/request_permission', () => ({
++      outcome: { outcome: 'selected', optionId: 'approve_once' },
++    }));
++
++    const sessionId = await newSession(c);
++    let resolved = false;
++    const promptPromise = c
++      .send('session/prompt', {
++        sessionId,
++        prompt: [{ type: 'text', text: 'start a background command' }],
++      })
++      .then((result) => {
++        resolved = true;
++        return result;
++      });
++
++    await waitFor(() => assistantText(c).includes('waiting'));
++    await waitFor(() => assistantText(c).includes('picked it up'), 30_000);
++    expect(resolved).toBe(false);
++
++    const result = (await promptPromise) as { stopReason: string };
++    expect(result.stopReason).toBe('end_turn');
++    expect(assistantText(c)).toContain('picked it up');
++  }, 60_000);
 +
 +  it('answers as soon as the turn ends when nothing follows it', async () => {
 +    const c = await boot();
